@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 # ── Slack config ──────────────────────────────────────────────────────────────
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_MAX_BLOCKS = 50
 
 # ── Screener parameters ───────────────────────────────────────────────────────
 MIN_VOLUME          = 500_000
@@ -162,64 +163,84 @@ def passes_filters(row: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 – Build Slack message
+# STEP 4 – Build Slack messages
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_slack_message(results: list[dict]) -> dict:
-    """Build a Slack Block Kit message payload."""
+def build_result_block(result: dict) -> dict:
+    """Build a Slack section block for a matching stock."""
+    hist_emoji = "🔴" if result["histogram"] < 0 else "🟡"
+    return {
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": (
+                f"*{result['ticker']}*  —  ${result['price']:,.2f}\n"
+                f"Vol: {result['volume']:,}  |  180 SMA: ${result['sma180']:,.2f}\n"
+                f"MACD: {result['macd']:.4f}  |  Signal: {result['signal']:.4f}  |  "
+                f"{hist_emoji} Hist: {result['histogram']:.4f}"
+            )
+        }
+    }
+
+
+def build_slack_messages(results: list[dict]) -> list[dict]:
+    """Build one or more Slack Block Kit message payloads."""
     scan_date = datetime.now().strftime("%B %d, %Y  %I:%M %p")
     match_label = f"{len(results)} Match{'es' if len(results) != 1 else ''}"
+    result_blocks = [build_result_block(result) for result in results]
 
-    blocks = [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": f"Swing Trade Screener - {match_label}", "emoji": True}
-        },
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": f"Scan run: *{scan_date}*"}]
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*Criteria:* Vol > 500K  |  Price > 180 SMA  |  "
-                    f"MACD Hist <= {MACD_HIST_MAX}  |  MACD crossed below Signal(9)"
-                )
-            }
-        },
-        {"type": "divider"},
-    ]
-
-    if not results:
-        blocks.append({
+    if not result_blocks:
+        result_blocks = [{
             "type": "section",
             "text": {"type": "mrkdwn", "text": "_No stocks matched your criteria today._"}
-        })
-    else:
-        for r in results:
-            hist_emoji = "🔴" if r["histogram"] < 0 else "🟡"
-            blocks.append({
+        }]
+
+    footer_blocks = [
+        {"type": "divider"},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": "Not financial advice. Always do your own due diligence."}]
+        },
+    ]
+
+    header_block_count = 4
+    max_result_blocks = SLACK_MAX_BLOCKS - header_block_count - len(footer_blocks)
+    total_pages = (len(result_blocks) + max_result_blocks - 1) // max_result_blocks
+    messages = []
+    first_result = 0
+
+    while first_result < len(result_blocks):
+        page_number = len(messages) + 1
+        page_suffix = f" (part {page_number}/{total_pages})" if total_pages > 1 else ""
+
+        header_blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"Swing Trade Screener - {match_label}{page_suffix}", "emoji": True}
+            },
+            {
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"Scan run: *{scan_date}*"}]
+            },
+            {
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"*{r['ticker']}*  —  ${r['price']:,.2f}\n"
-                        f"Vol: {r['volume']:,}  |  180 SMA: ${r['sma180']:,.2f}\n"
-                        f"MACD: {r['macd']:.4f}  |  Signal: {r['signal']:.4f}  |  "
-                        f"{hist_emoji} Hist: {r['histogram']:.4f}"
+                        f"*Criteria:* Vol > 500K  |  Price > 180 SMA  |  "
+                        f"MACD Hist <= {MACD_HIST_MAX}  |  MACD crossed below Signal(9)"
                     )
                 }
-            })
+            },
+            {"type": "divider"},
+        ]
 
-    blocks.append({"type": "divider"})
-    blocks.append({
-        "type": "context",
-        "elements": [{"type": "mrkdwn", "text": "Not financial advice. Always do your own due diligence."}]
-    })
+        next_result = first_result + max_result_blocks
+        blocks = header_blocks + result_blocks[first_result:next_result] + footer_blocks
+        messages.append({"blocks": blocks})
+        first_result = next_result
 
-    return {"blocks": blocks}
+    return messages
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,8 +301,12 @@ def main():
                  f"macd={r['macd']}  signal={r['signal']}  hist={r['histogram']}")
 
     # 3. Build and send Slack notification
-    payload = build_slack_message(results)
-    send_slack_message(payload)
+    payloads = build_slack_messages(results)
+    if len(payloads) > 1:
+        log.info(f"Splitting Slack notification into {len(payloads)} messages to stay under the {SLACK_MAX_BLOCKS}-block cap.")
+
+    for payload in payloads:
+        send_slack_message(payload)
 
 
 if __name__ == "__main__":
