@@ -5,6 +5,7 @@ Criteria:
   - Volume > 500,000
   - Rank stocks as READY, WATCHLIST, or REVERSAL candidates
   - Favor trend alignment, pullbacks near SMA9/EMA20, RSI recovery, MACD improvement, and volume
+  - Move otherwise qualified candidates into DANGER when earnings are near
 
 Data Source: Finviz (free, via finviz Python library)
 Output: Slack watchlist with staged swing-trade candidates
@@ -16,7 +17,8 @@ import sys
 import json
 import logging
 import traceback
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
 
@@ -36,6 +38,15 @@ log = logging.getLogger(__name__)
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 SLACK_MAX_BLOCKS = 50
 
+# ── Earnings config ───────────────────────────────────────────────────────────
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+FINNHUB_EARNINGS_URL = "https://finnhub.io/api/v1/calendar/earnings"
+try:
+    EARNINGS_LOOKAHEAD_DAYS = int(os.getenv("EARNINGS_LOOKAHEAD_DAYS", "5"))
+except ValueError:
+    EARNINGS_LOOKAHEAD_DAYS = 5
+EARNINGS_LOOKAHEAD_DAYS = max(EARNINGS_LOOKAHEAD_DAYS, 0)
+
 # ── Screener parameters ───────────────────────────────────────────────────────
 MIN_PRICE           = 2.00
 MIN_VOLUME          = 500_000
@@ -54,8 +65,9 @@ MAX_RESULTS_BY_STAGE = {
     "READY": 20,
     "WATCHLIST": 40,
     "REVERSAL": 20,
+    "DANGER": 40,
 }
-STAGE_ORDER = ("READY", "WATCHLIST", "REVERSAL")
+STAGE_ORDER = ("READY", "WATCHLIST", "REVERSAL", "DANGER")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -351,6 +363,149 @@ def stage_candidate(row: dict) -> dict | None:
     }
 
 
+def parse_earnings_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def earnings_symbol_key(symbol: str) -> str:
+    return str(symbol).upper().strip().replace("-", ".")
+
+
+def fetch_earnings_calendar(tickers: list[str]) -> dict[str, dict]:
+    """Return upcoming Finnhub earnings events for the staged candidates."""
+    tracked = {
+        earnings_symbol_key(ticker): str(ticker).upper().strip()
+        for ticker in tickers
+        if ticker
+    }
+    if not tracked:
+        return {}
+
+    if not FINNHUB_API_KEY:
+        log.warning("FINNHUB_API_KEY is not set. Earnings DANGER list disabled.")
+        return {}
+
+    start_date = datetime.now().date()
+    end_date = start_date + timedelta(days=EARNINGS_LOOKAHEAD_DAYS)
+    params = {
+        "from": start_date.isoformat(),
+        "to": end_date.isoformat(),
+        "international": "false",
+        "token": FINNHUB_API_KEY,
+    }
+    url = f"{FINNHUB_EARNINGS_URL}?{urlencode(params)}"
+    req = Request(url, headers={"User-Agent": "stock-screener/1.0"})
+
+    log.info(f"Fetching Finnhub earnings calendar from {start_date} to {end_date} ...")
+    try:
+        with urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        log.warning(f"Finnhub HTTP error {exc.code}: {body[:300]}")
+        return {}
+    except URLError as exc:
+        log.warning(f"Finnhub connection error: {exc.reason}")
+        return {}
+    except (json.JSONDecodeError, ValueError) as exc:
+        log.warning(f"Finnhub returned invalid earnings data: {exc}")
+        return {}
+    except Exception as exc:
+        log.warning(f"Unexpected Finnhub earnings error: {exc}")
+        return {}
+
+    calendar_events = payload.get("earningsCalendar", []) if isinstance(payload, dict) else []
+    if not isinstance(calendar_events, list):
+        log.warning("Finnhub returned earnings data in an unexpected format.")
+        return {}
+
+    earnings_by_ticker = {}
+    for event in calendar_events:
+        if not isinstance(event, dict):
+            continue
+        symbol = event.get("symbol")
+        ticker = tracked.get(earnings_symbol_key(symbol))
+        if not ticker:
+            continue
+
+        report_date = parse_earnings_date(event.get("date"))
+        if not report_date:
+            continue
+
+        days_until = (report_date - start_date).days
+        if days_until < 0 or days_until > EARNINGS_LOOKAHEAD_DAYS:
+            continue
+
+        current = earnings_by_ticker.get(ticker)
+        if current and current["days_until"] <= days_until:
+            continue
+
+        earnings_by_ticker[ticker] = {
+            "date": report_date.isoformat(),
+            "days_until": days_until,
+            "hour": str(event.get("hour") or "").lower(),
+        }
+
+    log.info(
+        f"Finnhub flagged {len(earnings_by_ticker)} candidate(s) with earnings "
+        f"inside {EARNINGS_LOOKAHEAD_DAYS} day(s)."
+    )
+    return earnings_by_ticker
+
+
+def format_earnings_warning(earnings: dict) -> str:
+    days_until = earnings["days_until"]
+    if days_until == 0:
+        timing = "today"
+    elif days_until == 1:
+        timing = "tomorrow"
+    else:
+        timing = f"in {days_until} days"
+
+    hour_labels = {
+        "bmo": "before open",
+        "amc": "after close",
+        "dmh": "during market",
+    }
+    hour = hour_labels.get(earnings.get("hour", ""), "")
+    hour_text = f", {hour}" if hour else ""
+    return f"earnings {earnings['date']} ({timing}{hour_text})"
+
+
+def apply_earnings_danger(candidates: list[dict], earnings_by_ticker: dict[str, dict]) -> list[dict]:
+    """Move otherwise qualified candidates into DANGER when earnings are close."""
+    if not earnings_by_ticker:
+        return candidates
+
+    adjusted = []
+    moved_count = 0
+    for candidate in candidates:
+        ticker = str(candidate["ticker"]).upper().strip()
+        earnings = earnings_by_ticker.get(ticker)
+        if not earnings:
+            adjusted.append(candidate)
+            continue
+
+        original_stage = candidate["stage"]
+        danger_candidate = {
+            **candidate,
+            "stage": "DANGER",
+            "original_stage": original_stage,
+            "reasons": [f"would be {original_stage}", *candidate.get("reasons", [])][:4],
+            "warnings": [format_earnings_warning(earnings), *candidate.get("warnings", [])][:3],
+        }
+        adjusted.append(danger_candidate)
+        moved_count += 1
+
+    log.info(f"Moved {moved_count} candidate(s) into DANGER due to nearby earnings.")
+    return adjusted
+
+
 def sort_and_limit_candidates(candidates: list[dict]) -> list[dict]:
     """Sort by stage and score, then keep Slack output focused."""
     ordered = []
@@ -374,6 +529,10 @@ def fmt_pct(value: float) -> str:
 
 def build_result_block(result: dict) -> dict:
     """Build a Slack section block for a watchlist candidate."""
+    stage_label = result["stage"]
+    if result["stage"] == "DANGER" and result.get("original_stage"):
+        stage_label = f"DANGER (was {result['original_stage']})"
+
     reason_text = "; ".join(result["reasons"])
     warning_text = f"\n_Watch:_ {', '.join(result['warnings'])}" if result["warnings"] else ""
     return {
@@ -381,7 +540,7 @@ def build_result_block(result: dict) -> dict:
         "text": {
             "type": "mrkdwn",
             "text": (
-                f"*{result['ticker']}* | *{result['stage']}* | Score {result['score']} | ${result['price']:,.2f}\n"
+                f"*{result['ticker']}* | *{stage_label}* | Score {result['score']} | ${result['price']:,.2f}\n"
                 f"RSI {result['rsi']:.1f} ({fmt_pct(result['rsi_delta_3'])} 3 bars) | "
                 f"MACD hist {result['histogram']:.4f} ({fmt_pct(result['histogram_delta_3'])}) | "
                 f"Rel vol {result['rel_volume']:.2f}x | ATR {result['atr_pct']:.1f}%\n"
@@ -457,7 +616,7 @@ def build_slack_messages(results: list[dict]) -> list[dict]:
                     "type": "mrkdwn",
                     "text": (
                         "*Stages:* READY = trigger forming/confirmed | WATCHLIST = near trigger | "
-                        "REVERSAL = higher-risk beatdown recovery"
+                        "REVERSAL = beatdown recovery | DANGER = setup with earnings inside window"
                     )
                 }
             },
@@ -525,6 +684,8 @@ def main():
             log.info(f"    ✅ {ticker} {candidate['stage']} score={candidate['score']}")
             candidates.append(candidate)
 
+    earnings_by_ticker = fetch_earnings_calendar([candidate["ticker"] for candidate in candidates])
+    candidates = apply_earnings_danger(candidates, earnings_by_ticker)
     results = sort_and_limit_candidates(candidates)
 
     log.info(f"\n=== Scan complete: {len(candidates)} staged candidate(s), {len(results)} shown ===")
