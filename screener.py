@@ -8,7 +8,7 @@ Criteria:
   - Move otherwise qualified candidates into DANGER when earnings are near
 
 Data Source: Finviz (free, via finviz Python library)
-Output: Slack watchlist with staged swing-trade candidates
+Output: Email watchlist via Resend (resend.com)
 """
 
 import math
@@ -34,9 +34,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Slack config ──────────────────────────────────────────────────────────────
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
-SLACK_MAX_BLOCKS = 50
+# ── Email config (Resend) ─────────────────────────────────────────────────────
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+EMAIL_FROM     = os.getenv("EMAIL_FROM", "")   # e.g. screener@yourdomain.com
+EMAIL_TO       = os.getenv("EMAIL_TO", "")     # your personal email address
+RESEND_API_URL = "https://api.resend.com/emails"
 
 # ── Earnings config ───────────────────────────────────────────────────────────
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
@@ -507,7 +509,7 @@ def apply_earnings_danger(candidates: list[dict], earnings_by_ticker: dict[str, 
 
 
 def sort_and_limit_candidates(candidates: list[dict]) -> list[dict]:
-    """Sort by stage and score, then keep Slack output focused."""
+    """Sort by stage and score, then cap each stage at its configured limit."""
     ordered = []
     for stage in STAGE_ORDER:
         stage_candidates = [candidate for candidate in candidates if candidate["stage"] == stage]
@@ -520,143 +522,159 @@ def sort_and_limit_candidates(candidates: list[dict]) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 4 – Build Slack messages
+# STEP 4 – Build email HTML
 # ─────────────────────────────────────────────────────────────────────────────
+
+STAGE_COLORS = {
+    "READY":     "#1a7f37",
+    "WATCHLIST": "#0969da",
+    "REVERSAL":  "#9a3a00",
+    "DANGER":    "#cf222e",
+}
 
 def fmt_pct(value: float) -> str:
     return f"{value:+.1f}%"
 
 
-def build_result_block(result: dict) -> dict:
-    """Build a Slack section block for a watchlist candidate."""
-    stage_label = result["stage"]
-    if result["stage"] == "DANGER" and result.get("original_stage"):
+def _result_row(result: dict) -> str:
+    stage = result["stage"]
+    stage_label = stage
+    if stage == "DANGER" and result.get("original_stage"):
         stage_label = f"DANGER (was {result['original_stage']})"
 
-    reason_text = "; ".join(result["reasons"])
-    warning_text = f"\n_Watch:_ {', '.join(result['warnings'])}" if result["warnings"] else ""
-    return {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": (
-                f"*{result['ticker']}* | *{stage_label}* | Score {result['score']} | ${result['price']:,.2f}\n"
-                f"RSI {result['rsi']:.1f} ({fmt_pct(result['rsi_delta_3'])} 3 bars) | "
-                f"MACD hist {result['histogram']:.4f} ({fmt_pct(result['histogram_delta_3'])}) | "
-                f"Rel vol {result['rel_volume']:.2f}x | ATR {result['atr_pct']:.1f}%\n"
-                f"SMA9 {fmt_pct(result['distance_sma9_pct'])} | EMA20 {fmt_pct(result['distance_ema20_pct'])} | "
-                f"52w high {fmt_pct(result['drawdown_52w_pct'])}\n"
-                f"_Why:_ {reason_text}"
-                f"{warning_text}"
-            )
-        }
-    }
+    color = STAGE_COLORS.get(stage, "#333")
+    reasons = "; ".join(result["reasons"])
+    warnings_html = (
+        f'<div style="color:#cf222e;font-size:12px;margin-top:2px">'
+        f'&#9888; {", ".join(result["warnings"])}</div>'
+        if result["warnings"] else ""
+    )
+
+    return f"""
+<tr style="border-bottom:1px solid #e0e0e0">
+  <td style="padding:10px 8px;white-space:nowrap">
+    <strong style="font-size:15px">{result['ticker']}</strong>
+  </td>
+  <td style="padding:10px 8px;white-space:nowrap">
+    <span style="background:{color};color:#fff;padding:2px 7px;border-radius:4px;font-size:12px;font-weight:600">
+      {stage_label}
+    </span>
+  </td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">{result['score']}</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">${result['price']:,.2f}</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">{result['rsi']:.1f} ({fmt_pct(result['rsi_delta_3'])})</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">{result['histogram']:.4f} ({fmt_pct(result['histogram_delta_3'])})</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">{result['rel_volume']:.2f}x</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">{result['atr_pct']:.1f}%</td>
+  <td style="padding:10px 8px;text-align:right;white-space:nowrap">
+    SMA9 {fmt_pct(result['distance_sma9_pct'])} / EMA20 {fmt_pct(result['distance_ema20_pct'])} / 52w {fmt_pct(result['drawdown_52w_pct'])}
+  </td>
+  <td style="padding:10px 8px;font-size:12px;color:#555">
+    {reasons}
+    {warnings_html}
+  </td>
+</tr>"""
 
 
-def build_stage_header(stage: str, count: int) -> dict:
-    return {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": f"*{stage}* ({count})"}
-    }
-
-
-def build_content_blocks(results: list[dict]) -> list[dict]:
-    blocks = []
-    for stage in STAGE_ORDER:
-        stage_results = [result for result in results if result["stage"] == stage]
-        if not stage_results:
-            continue
-        blocks.append(build_stage_header(stage, len(stage_results)))
-        blocks.extend(build_result_block(result) for result in stage_results)
-    return blocks
-
-
-def build_slack_messages(results: list[dict]) -> list[dict]:
-    """Build one or more Slack Block Kit message payloads."""
+def build_email_html(results: list[dict]) -> str:
     scan_date = datetime.now().strftime("%B %d, %Y  %I:%M %p")
     match_label = f"{len(results)} Candidate{'s' if len(results) != 1 else ''}"
-    content_blocks = build_content_blocks(results)
 
-    if not content_blocks:
-        content_blocks = [{
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": "_No staged swing-trade candidates matched today._"}
-        }]
+    stage_sections = ""
+    for stage in STAGE_ORDER:
+        stage_results = [r for r in results if r["stage"] == stage]
+        if not stage_results:
+            continue
+        color = STAGE_COLORS.get(stage, "#333")
+        rows = "".join(_result_row(r) for r in stage_results)
+        stage_sections += f"""
+<h3 style="margin:28px 0 8px;color:{color}">{stage} ({len(stage_results)})</h3>
+<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:monospace">
+  <thead>
+    <tr style="background:#f6f8fa;text-align:left">
+      <th style="padding:6px 8px">Ticker</th>
+      <th style="padding:6px 8px">Stage</th>
+      <th style="padding:6px 8px;text-align:right">Score</th>
+      <th style="padding:6px 8px;text-align:right">Price</th>
+      <th style="padding:6px 8px;text-align:right">RSI (Δ3)</th>
+      <th style="padding:6px 8px;text-align:right">MACD hist (Δ3)</th>
+      <th style="padding:6px 8px;text-align:right">Rel Vol</th>
+      <th style="padding:6px 8px;text-align:right">ATR%</th>
+      <th style="padding:6px 8px;text-align:right">Distance</th>
+      <th style="padding:6px 8px">Why / Watch</th>
+    </tr>
+  </thead>
+  <tbody>{rows}</tbody>
+</table>"""
 
-    footer_blocks = [
-        {"type": "divider"},
-        {
-            "type": "context",
-            "elements": [{"type": "mrkdwn", "text": "Not financial advice. Always do your own due diligence."}]
-        },
-    ]
+    if not stage_sections:
+        stage_sections = "<p><em>No staged swing-trade candidates matched today.</em></p>"
 
-    header_block_count = 4
-    max_result_blocks = SLACK_MAX_BLOCKS - header_block_count - len(footer_blocks)
-    total_pages = (len(content_blocks) + max_result_blocks - 1) // max_result_blocks
-    messages = []
-    first_result = 0
+    legend = (
+        "<strong>READY</strong> = trigger forming/confirmed &nbsp;|&nbsp; "
+        "<strong>WATCHLIST</strong> = near trigger &nbsp;|&nbsp; "
+        "<strong>REVERSAL</strong> = beatdown recovery &nbsp;|&nbsp; "
+        "<strong>DANGER</strong> = setup with earnings inside window"
+    )
 
-    while first_result < len(content_blocks):
-        page_number = len(messages) + 1
-        page_suffix = f" (part {page_number}/{total_pages})" if total_pages > 1 else ""
-
-        header_blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"Swing Trade Watchlist - {match_label}{page_suffix}", "emoji": True}
-            },
-            {
-                "type": "context",
-                "elements": [{"type": "mrkdwn", "text": f"Scan run: *{scan_date}*"}]
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*Stages:* READY = trigger forming/confirmed | WATCHLIST = near trigger | "
-                        "REVERSAL = beatdown recovery | DANGER = setup with earnings inside window"
-                    )
-                }
-            },
-            {"type": "divider"},
-        ]
-
-        next_result = first_result + max_result_blocks
-        blocks = header_blocks + content_blocks[first_result:next_result] + footer_blocks
-        messages.append({"blocks": blocks})
-        first_result = next_result
-
-    return messages
+    return f"""<!DOCTYPE html>
+<html>
+<body style="font-family:Arial,sans-serif;max-width:1200px;margin:0 auto;padding:20px;color:#24292f">
+  <h2 style="margin-bottom:4px">Swing Trade Watchlist &mdash; {match_label}</h2>
+  <p style="color:#57606a;margin-top:0">Scan run: {scan_date}</p>
+  <p style="font-size:12px;color:#57606a">{legend}</p>
+  {stage_sections}
+  <hr style="margin-top:32px;border:none;border-top:1px solid #e0e0e0">
+  <p style="font-size:11px;color:#8c959f">Not financial advice. Always do your own due diligence.</p>
+</body>
+</html>"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 – Send Slack message
+# STEP 5 – Send email via Resend
 # ─────────────────────────────────────────────────────────────────────────────
 
-def send_slack_message(payload: dict):
-    """POST a JSON payload to the Slack incoming webhook."""
-    if not SLACK_WEBHOOK_URL:
-        log.error("SLACK_WEBHOOK_URL is not set. Cannot send notification.")
-        raise ValueError("SLACK_WEBHOOK_URL environment variable is missing.")
+def send_email(html: str, subject: str):
+    """POST an email via the Resend API."""
+    if not RESEND_API_KEY:
+        log.error("RESEND_API_KEY is not set. Cannot send email.")
+        raise ValueError("RESEND_API_KEY environment variable is missing.")
+    if not EMAIL_FROM:
+        log.error("EMAIL_FROM is not set.")
+        raise ValueError("EMAIL_FROM environment variable is missing.")
+    if not EMAIL_TO:
+        log.error("EMAIL_TO is not set.")
+        raise ValueError("EMAIL_TO environment variable is missing.")
 
-    log.info("Sending Slack notification …")
+    log.info(f"Sending email to {EMAIL_TO} via Resend …")
+    payload = {
+        "from": EMAIL_FROM,
+        "to": [EMAIL_TO],
+        "subject": subject,
+        "html": html,
+    }
     data = json.dumps(payload).encode("utf-8")
-    req = Request(SLACK_WEBHOOK_URL, data=data, headers={"Content-Type": "application/json"})
+    req = Request(
+        RESEND_API_URL,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
 
     try:
         with urlopen(req, timeout=30) as resp:
             body = resp.read().decode("utf-8")
-            log.info(f"Slack responded: {resp.status} – {body}")
+            log.info(f"Resend responded: {resp.status} – {body}")
     except HTTPError as e:
-        log.error(f"Slack HTTP error {e.code}: {e.read().decode()}")
+        log.error(f"Resend HTTP error {e.code}: {e.read().decode()}")
         raise
     except URLError as e:
-        log.error(f"Slack connection error: {e.reason}")
+        log.error(f"Resend connection error: {e.reason}")
         raise
     except Exception as e:
-        log.error(f"Unexpected Slack error: {e}")
+        log.error(f"Unexpected Resend error: {e}")
         log.error(traceback.format_exc())
         raise
 
@@ -693,13 +711,11 @@ def main():
         log.info(f"  {r['stage']}  {r['ticker']}  score={r['score']}  price={r['price']:.2f}  "
                  f"rsi={r['rsi']:.1f}  rel_vol={r['rel_volume']:.2f}  hist={r['histogram']:.4f}")
 
-    # 3. Build and send Slack notification
-    payloads = build_slack_messages(results)
-    if len(payloads) > 1:
-        log.info(f"Splitting Slack notification into {len(payloads)} messages to stay under the {SLACK_MAX_BLOCKS}-block cap.")
-
-    for payload in payloads:
-        send_slack_message(payload)
+    # 3. Build and send email notification
+    scan_date = datetime.now().strftime("%B %d, %Y")
+    subject = f"Swing Trade Watchlist – {len(results)} Candidate{'s' if len(results) != 1 else ''} ({scan_date})"
+    html = build_email_html(results)
+    send_email(html, subject)
 
 
 if __name__ == "__main__":
