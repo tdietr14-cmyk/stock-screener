@@ -8,7 +8,7 @@ Criteria:
   - Move otherwise qualified candidates into DANGER when earnings are near
 
 Data Source: Finviz (free, via finviz Python library)
-Output: Email watchlist via Resend (resend.com)
+Output: Email watchlist via Gmail SMTP
 """
 
 import math
@@ -16,8 +16,11 @@ import os
 import sys
 import json
 import logging
+import smtplib
 import traceback
 from datetime import date, datetime, timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import URLError, HTTPError
@@ -34,11 +37,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Email config (Resend) ─────────────────────────────────────────────────────
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-EMAIL_FROM     = os.getenv("EMAIL_FROM", "")   # e.g. screener@yourdomain.com
-EMAIL_TO       = os.getenv("EMAIL_TO", "")     # your personal email address
-RESEND_API_URL = "https://api.resend.com/emails"
+# ── Email config (Gmail SMTP) ─────────────────────────────────────────────────
+GMAIL_USER     = os.getenv("GMAIL_USER", "")   # your Gmail address
+GMAIL_APP_PASS = os.getenv("GMAIL_APP_PASS", "") # 16-char Google App Password
+EMAIL_TO       = os.getenv("EMAIL_TO", "")     # where to deliver the watchlist
+SMTP_HOST      = "smtp.gmail.com"
+SMTP_PORT      = 587
 
 # ── Earnings config ───────────────────────────────────────────────────────────
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
@@ -631,50 +635,44 @@ def build_email_html(results: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP 5 – Send email via Resend
+# STEP 5 – Send email via Gmail SMTP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def send_email(html: str, subject: str):
-    """POST an email via the Resend API."""
-    if not RESEND_API_KEY:
-        log.error("RESEND_API_KEY is not set. Cannot send email.")
-        raise ValueError("RESEND_API_KEY environment variable is missing.")
-    if not EMAIL_FROM:
-        log.error("EMAIL_FROM is not set.")
-        raise ValueError("EMAIL_FROM environment variable is missing.")
+    """Send an HTML email via Gmail SMTP using an App Password."""
+    if not GMAIL_USER:
+        log.error("GMAIL_USER is not set. Cannot send email.")
+        raise ValueError("GMAIL_USER environment variable is missing.")
+    if not GMAIL_APP_PASS:
+        log.error("GMAIL_APP_PASS is not set. Cannot send email.")
+        raise ValueError("GMAIL_APP_PASS environment variable is missing.")
     if not EMAIL_TO:
-        log.error("EMAIL_TO is not set.")
+        log.error("EMAIL_TO is not set. Cannot send email.")
         raise ValueError("EMAIL_TO environment variable is missing.")
 
-    log.info(f"Sending email to {EMAIL_TO} via Resend …")
-    payload = {
-        "from": EMAIL_FROM,
-        "to": [EMAIL_TO],
-        "subject": subject,
-        "html": html,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = Request(
-        RESEND_API_URL,
-        data=data,
-        headers={
-            "Authorization": f"Bearer {RESEND_API_KEY}",
-            "Content-Type": "application/json",
-        },
-    )
+    log.info(f"Sending email to {EMAIL_TO} via Gmail SMTP …")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = GMAIL_USER
+    msg["To"]      = EMAIL_TO
+    msg.attach(MIMEText(html, "html"))
 
     try:
-        with urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8")
-            log.info(f"Resend responded: {resp.status} – {body}")
-    except HTTPError as e:
-        log.error(f"Resend HTTP error {e.code}: {e.read().decode()}")
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(GMAIL_USER, GMAIL_APP_PASS)
+            server.sendmail(GMAIL_USER, EMAIL_TO, msg.as_string())
+            log.info("Email sent successfully via Gmail SMTP.")
+    except smtplib.SMTPAuthenticationError:
+        log.error("Gmail SMTP authentication failed. Check GMAIL_USER and GMAIL_APP_PASS.")
         raise
-    except URLError as e:
-        log.error(f"Resend connection error: {e.reason}")
+    except smtplib.SMTPException as e:
+        log.error(f"Gmail SMTP error: {e}")
         raise
     except Exception as e:
-        log.error(f"Unexpected Resend error: {e}")
+        log.error(f"Unexpected email error: {e}")
         log.error(traceback.format_exc())
         raise
 
