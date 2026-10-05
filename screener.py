@@ -96,7 +96,7 @@ def get_finviz_candidates() -> list[str]:
         "Average Volume":  "Over 1M",
         "Price":           "Over $5",
         "Country":         "USA",
-        "Market Cap.":     "Small+ (over $300mln)",
+        "Market Cap.":     "+Small (over $300mln)",
         "Optionable":      "Yes",       # excludes ETFs, funds, and illiquid names
         "Shortable":       "Yes",       # only exchange-listed common stocks
     }
