@@ -88,16 +88,21 @@ def get_finviz_candidates() -> list[str]:
     log.info("Fetching candidates from Finviz …")
     foverview = Overview()
 
-    # Finviz filter keys: https://finviz.com/screener.ashx
-    # Kept tight intentionally — Finviz blocks free-tier scraping after ~50 pages
-    # (~1000 rows). 1M+ avg vol + USA + price >$5 keeps the universe under that.
+    # Finviz free tier hard-blocks at row 1001 regardless of request rate.
+    # Keep the universe under 1000 rows with tight filters AND sort by relative
+    # volume descending so the most active (most tradeable) stocks come first —
+    # if we ever approach the limit again, we'll have already seen the best ones.
     filters = {
-        "Average Volume": "Over 1M",
-        "Price":          "Over $5",
-        "Country":        "USA",
+        "Average Volume":  "Over 1M",
+        "Price":           "Over $5",
+        "Country":         "USA",
+        "Market Cap.":     "Small+ (over $300mln)",
+        "Optionable":      "Yes",       # excludes ETFs, funds, and illiquid names
+        "Shortable":       "Yes",       # only exchange-listed common stocks
     }
 
     foverview.set_filter(filters_dict=filters)
+    foverview.set_order(order="-relativevolume")
     df = foverview.screener_view()
 
     if df is None or df.empty:
