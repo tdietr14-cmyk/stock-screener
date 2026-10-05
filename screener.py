@@ -89,9 +89,12 @@ def get_finviz_candidates() -> list[str]:
     foverview = Overview()
 
     # Finviz filter keys: https://finviz.com/screener.ashx
+    # Kept tight intentionally — Finviz blocks free-tier scraping after ~50 pages
+    # (~1000 rows). 1M+ avg vol + USA + price >$5 keeps the universe under that.
     filters = {
-        "Average Volume": "Over 500K",
-        "Price": "Over $2",
+        "Average Volume": "Over 1M",
+        "Price":          "Over $5",
+        "Country":        "USA",
     }
 
     foverview.set_filter(filters_dict=filters)
