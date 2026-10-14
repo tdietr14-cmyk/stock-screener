@@ -79,17 +79,20 @@ STAGE_ORDER = ("READY", "WATCHLIST", "REVERSAL", "DANGER")
 # STEP 1 – Pull candidates from Finviz
 # ─────────────────────────────────────────────────────────────────────────────
 
+_WIKI_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; swing-screener/1.0)"}
+
+
 def get_sp500_tickers() -> list[str]:
     """Fetch S&P 500 tickers from Wikipedia."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    tables = pd.read_html(url, storage_options=_WIKI_HEADERS)
     return tables[0]["Symbol"].tolist()
 
 
 def get_sp400_tickers() -> list[str]:
     """Fetch S&P MidCap 400 tickers from Wikipedia."""
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
-    tables = pd.read_html(url)
+    tables = pd.read_html(url, storage_options=_WIKI_HEADERS)
     return tables[0]["Symbol"].tolist()
 
 
