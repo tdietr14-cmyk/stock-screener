@@ -7,7 +7,7 @@ Criteria:
   - Favor trend alignment, pullbacks near SMA9/EMA20, RSI recovery, MACD improvement, and volume
   - Move otherwise qualified candidates into DANGER when earnings are near
 
-Data Source: Finviz (free, via finviz Python library)
+Data Source: S&P 500 + S&P MidCap 400 universe via Wikipedia
 Output: Email watchlist via Gmail SMTP
 """
 
@@ -27,7 +27,6 @@ from urllib.error import URLError, HTTPError
 
 import pandas as pd
 import yfinance as yf
-from finvizfinance.screener.overview import Overview
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -80,36 +79,50 @@ STAGE_ORDER = ("READY", "WATCHLIST", "REVERSAL", "DANGER")
 # STEP 1 – Pull candidates from Finviz
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_sp500_tickers() -> list[str]:
+    """Fetch S&P 500 tickers from Wikipedia."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    return tables[0]["Symbol"].tolist()
+
+
+def get_sp400_tickers() -> list[str]:
+    """Fetch S&P MidCap 400 tickers from Wikipedia."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies"
+    tables = pd.read_html(url)
+    return tables[0]["Symbol"].tolist()
+
+
 def get_finviz_candidates() -> list[str]:
     """
-    Use Finviz's free screener to pre-filter stocks by average volume and minimum price.
-    Trend, pullback, and reversal rules are scored later with yfinance data.
+    Return the combined S&P 500 + S&P MidCap 400 universe (~900 tickers).
+    All are liquid US common stocks — no ETFs, funds, or foreign listings.
     """
-    log.info("Fetching candidates from Finviz …")
-    foverview = Overview()
+    log.info("Loading S&P 500 + MidCap 400 universe from Wikipedia …")
+    try:
+        sp500 = get_sp500_tickers()
+        log.info(f"  S&P 500: {len(sp500)} tickers")
+    except Exception as e:
+        log.warning(f"  Could not fetch S&P 500: {e}")
+        sp500 = []
 
-    # Finviz free tier hard-blocks at row 1001 regardless of request rate.
-    # Keep the universe under 1000 rows with tight filters AND sort by relative
-    # volume descending so the most active (most tradeable) stocks come first —
-    # if we ever approach the limit again, we'll have already seen the best ones.
-    filters = {
-        "Average Volume":  "Over 1M",
-        "Price":           "Over $5",
-        "Country":         "USA",
-        "Market Cap.":     "+Small (over $300mln)",
-    }
+    try:
+        sp400 = get_sp400_tickers()
+        log.info(f"  MidCap 400: {len(sp400)} tickers")
+    except Exception as e:
+        log.warning(f"  Could not fetch MidCap 400: {e}")
+        sp400 = []
 
-    foverview.set_filter(filters_dict=filters)
-    foverview.set_order(order="-relativevolume")
-    df = foverview.screener_view()
+    # Deduplicate, normalize dots to dashes (BRK.B → BRK-B for yfinance)
+    combined = list(dict.fromkeys(sp500 + sp400))
+    combined = [t.replace(".", "-") for t in combined]
 
-    if df is None or df.empty:
-        log.warning("Finviz returned no candidates.")
+    if not combined:
+        log.error("Could not load any tickers from Wikipedia.")
         return []
 
-    tickers = df["Ticker"].tolist()
-    log.info(f"Finviz returned {len(tickers)} candidates.")
-    return tickers
+    log.info(f"Universe: {len(combined)} tickers total.")
+    return combined
 
 
 # ─────────────────────────────────────────────────────────────────────────────
