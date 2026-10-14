@@ -97,7 +97,6 @@ def get_finviz_candidates() -> list[str]:
         "Price":           "Over $5",
         "Country":         "USA",
         "Market Cap.":     "+Small (over $300mln)",
-        "Option/Short":    "Optionable and shortable",  # excludes ETFs, funds, illiquid names
     }
 
     foverview.set_filter(filters_dict=filters)
